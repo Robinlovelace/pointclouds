@@ -10,6 +10,12 @@ per-point **classification** codes, **sidewalk clear-width** estimates,
 **verticality** and photographic colour, which makes it a good worked example
 for learning how street-scene point clouds are analysed.
 
+![Demo of the sidewalk point cloud viewer](https://github.com/Robinlovelace/pointclouds/releases/download/viewer-demo-v1/viewer-demo.gif)
+
+*Full-size formats: [MP4 (2.7 MB)](https://github.com/Robinlovelace/pointclouds/releases/download/viewer-demo-v1/viewer-demo.mp4)
+and [WebM (4.9 MB)](https://github.com/Robinlovelace/pointclouds/releases/download/viewer-demo-v1/viewer-demo.webm)
+are attached to the [same release](https://github.com/Robinlovelace/pointclouds/releases/tag/viewer-demo-v1).*
+
 ## Quick start
 
 ```bash
