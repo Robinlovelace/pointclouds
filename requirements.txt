@@ -1,2 +1,2 @@
-laspy[laz]>=2.5
+laspy[lazrs]>=2.5
 numpy>=1.24
