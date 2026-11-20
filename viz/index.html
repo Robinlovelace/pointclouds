@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sidewalk point cloud viewer - 3D LiDAR teaching example</title>
+<style>
+  :root {
+    --panel-bg: rgba(17, 18, 24, 0.92);
+    --panel-border: #2a2d3a;
+    --text: #dfe3ee;
+    --muted: #8b90a3;
+    --accent: #4fc3f7;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #101018; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  #panel {
+    position: absolute; top: 16px; left: 16px; width: 330px;
+    max-height: calc(100% - 32px); overflow-y: auto;
+    background: var(--panel-bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 10px;
+    padding: 14px 16px; font: 13px/1.45 system-ui, sans-serif;
+    backdrop-filter: blur(6px);
+  }
+  #panel h1 { font-size: 16px; margin: 0 0 2px; }
+  #panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+              color: var(--muted); margin: 16px 0 6px; }
+  #panel p { margin: 4px 0; }
+  #panel .sub { color: var(--muted); font-size: 12px; }
+  #panel label { display: block; margin: 3px 0; cursor: pointer; }
+  #panel select, #panel input[type="range"] { width: 100%; box-sizing: border-box; }
+  #panel select { background: #1c1e2a; color: var(--text); border: 1px solid var(--panel-border);
+                  border-radius: 6px; padding: 5px; margin-top: 4px; }
+  #legend .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  #legend .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+  #legend .count { color: var(--muted); margin-left: auto; font-size: 11px; }
+  #ramp { height: 12px; border-radius: 6px; margin: 6px 0 2px; }
+  #loading {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #101018; color: var(--text); font: 14px system-ui, sans-serif; z-index: 5;
+  }
+  #loading.done { display: none; }
+  #error { color: #ff8a80; }
+  details { margin-top: 10px; color: var(--muted); font-size: 12px; }
+  summary { cursor: pointer; color: var(--text); }
+  #credits a { color: var(--accent); }
+  #controls input[type="checkbox"] { accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="loading">Loading point cloud…</div>
+<div id="panel">
+  <h1>Sidewalk point cloud</h1>
+  <p class="sub">Open teaching example: 3D LiDAR scan of a street
+    (József Street, Budapest, May 2026, handheld scanner). Data (c) International
+    Federation of Pedestrians (IFP). See <a href="https://github.com/Robinlovelace/pointclouds">repository</a>.</p>
+
+  <h2>Colour by</h2>
+  <select id="mode">
+    <option value="rgb">Photographic colour (RGB)</option>
+    <option value="class" selected>Classification</option>
+    <option value="width">Sidewalk clear width</option>
+    <option value="vert">Verticality</option>
+    <option value="intensity">Intensity (greyscale)</option>
+  </select>
+
+  <div id="legend"></div>
+
+  <h2>Visible classes</h2>
+  <div id="controls"></div>
+
+  <h2>Point size</h2>
+  <input type="range" id="psize" min="1" max="10" step="0.5" value="3">
+  <span id="psizeVal" class="sub">3</span>
+
+  <details>
+    <summary>About the data</summary>
+    <p id="stats" class="sub"></p>
+    <p class="sub" id="fields"></p>
+  </details>
+  <details id="credits">
+    <summary>Credits and licence</summary>
+    <p class="sub">Point cloud: International Federation of Pedestrians (IFP),
+      scan of József Street, Budapest, May 2026
+      (<a href="https://data.ifpedestrians.org/etc/sidewalk_demo.laz">source</a>).
+      Viewer code: MIT licence, written to be read alongside the class codes
+      used by IFP's sidewalk analysis workflow.</p>
+  </details>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const CLASS_COLORS = {
+  0: 0x6e6e6e,  // grey  - not classified
+  1: 0xd8b26e,  // ochre - objects and facades
+  2: 0x2dd4a7,  // green - sidewalk
+  5: 0x2e7d32,  // dark green - tree cover
+  11: 0x5c8bd6, // blue  - pavement
+};
+
+const manifest = await fetch('./manifest.json').then(r => {
+  if (!r.ok) throw new Error(`manifest.json: HTTP ${r.status}`);
+  return r.json();
+});
+
+// ---- load interleaved binary -------------------------------------------
+const { point_count: n, bin } = manifest;
+const buf = await fetch(bin.path).then(r => {
+  if (!r.ok) throw new Error(`${bin.path}: HTTP ${r.status}`);
+  return r.arrayBuffer();
+});
+if (buf.byteLength !== n * bin.record_bytes) {
+  throw new Error(`size mismatch: ${buf.byteLength} bytes for ${n} records`);
+}
+const view = new DataView(buf);
+const pos = new Float32Array(n * 3);
+const rgb = new Uint8Array(n * 3);
+const cls = new Uint8Array(n);
+const intensity = new Uint8Array(n);
+const width = new Float32Array(n);
+const vert = new Float32Array(n);
+for (let i = 0; i < n; i++) {
+  const o = i * bin.record_bytes;
+  pos[i * 3] = view.getFloat32(o, true);
+  pos[i * 3 + 1] = view.getFloat32(o + 4, true);
+  pos[i * 3 + 2] = view.getFloat32(o + 8, true);
+  rgb[i * 3] = view.getUint8(o + 12);
+  rgb[i * 3 + 1] = view.getUint8(o + 13);
+  rgb[i * 3 + 2] = view.getUint8(o + 14);
+  cls[i] = view.getUint8(o + 15);
+  intensity[i] = view.getUint8(o + 16);
+  width[i] = view.getFloat32(o + 17, true);
+  vert[i] = view.getFloat32(o + 21, true);
+}
+
+// ---- three.js scene -----------------------------------------------------
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101018);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
+
+const lo = new THREE.Vector3(...manifest.bounds_min);
+const hi = new THREE.Vector3(...manifest.bounds_max);
+const centre = lo.clone().add(hi).multiplyScalar(0.5);
+const radius = lo.distanceTo(hi) / 2;
+
+camera.position.set(centre.x + radius * 1.4, centre.y + radius * 2.2, centre.z + radius * 1.8);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(centre);
+controls.update();
+
+// ---- geometry -----------------------------------------------------------
+const geometry = new THREE.BufferGeometry();
+let currentFilter = null; // Set of visible class ids, or null for all
+const colorArr = new Uint8Array(n * 3);
+const indexSel = new Uint32Array(n);
+const posSel = new Float32Array(n * 3);
+const colorSel = new Uint8Array(n * 3);
+
+const mat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, sizeAttenuation: true });
+const points = new THREE.Points(geometry, mat);
+scene.add(points);
+
+function rampWidth(w) {
+  // Blue at <= 1.5 m, white at 2.0 m, red at >= 2.5 m (clamped beyond).
+  const t = THREE.MathUtils.clamp((w - 1.5) / 1.0, 0, 1);
+  const c = new THREE.Color();
+  if (t < 0.5) c.setRGB(0.1 + 0.9 * (t * 2), 0.2 + 0.8 * (t * 2), 0.9);
+  else c.setRGB(1.0, 0.2 + 0.8 * ((1 - t) * 2), 0.1 + 0.9 * ((1 - t) * 2));
+  return c;
+}
+function rampVert(v) {
+  // horizontal (0) cyan -> vertical (1) red
+  return new THREE.Color().setHSL(0.5 * (1 - v), 0.9, 0.5);
+}
+
+function rebuild() {
+  const mode = document.getElementById('mode').value;
+  let m = 0;
+  for (let i = 0; i < n; i++) {
+    if (currentFilter && !currentFilter.has(cls[i])) continue;
+    indexSel[m] = i;
+    m++;
+  }
+  const sel = indexSel.subarray(0, m);
+  const posOut = posSel.subarray(0, m * 3);
+  const colOut = colorSel.subarray(0, m * 3);
+  for (let j = 0; j < m; j++) {
+    const i = sel[j];
+    posOut[j * 3] = pos[i * 3];
+    posOut[j * 3 + 1] = pos[i * 3 + 1];
+    posOut[j * 3 + 2] = pos[i * 3 + 2];
+    let c;
+    if (mode === 'rgb') {
+      colOut[j * 3] = rgb[i * 3];
+      colOut[j * 3 + 1] = rgb[i * 3 + 1];
+      colOut[j * 3 + 2] = rgb[i * 3 + 2];
+      continue;
+    } else if (mode === 'class') {
+      c = new THREE.Color(CLASS_COLORS[cls[i]] ?? 0xffffff);
+    } else if (mode === 'width') {
+      c = rampWidth(width[i]);
+    } else if (mode === 'vert') {
+      c = rampVert(vert[i]);
+    } else {
+      const g = intensity[i];
+      c = new THREE.Color(g / 255, g / 255, g / 255);
+    }
+    colOut[j * 3] = c.r * 255;
+    colOut[j * 3 + 1] = c.g * 255;
+    colOut[j * 3 + 2] = c.b * 255;
+  }
+  geometry.setAttribute('position', new THREE.BufferAttribute(posOut, 3, false));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colOut, 3, true));
+  geometry.computeBoundingSphere();
+  points.visible = m > 0;
+  document.getElementById('countShown').textContent = `${m.toLocaleString()} points shown`;
+}
+
+// ---- UI ------------------------------------------------------------------
+function rampCSS(t) { return `rgb(${t[0]},${t[1]},${t[2]})`; }
+
+function renderLegend() {
+  const mode = document.getElementById('mode').value;
+  const legend = document.getElementById('legend');
+  const controlsBox = document.getElementById('controls');
+  legend.innerHTML = '';
+  if (mode === 'class') {
+    for (const [id, info] of Object.entries(manifest.classes)) {
+      const c = CLASS_COLORS[id];
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span class="swatch" style="background:#${new THREE.Color(c).getHexString()}"></span>
+        <span>${info.name}</span><span class="count">${info.count_sampled.toLocaleString()}</span>`;
+      legend.appendChild(row);
+    }
+  } else if (mode === 'width') {
+    legend.innerHTML = `
+      <div id="ramp" style="background:linear-gradient(90deg, #1a3f8f, #ffffff, #ff1a1a)"></div>
+      <div class="row"><span class="sub">1.5 m (tight)</span><span class="count" style="margin-left:auto">2.5 m (wide)</span></div>`;
+  } else if (mode === 'vert') {
+    legend.innerHTML = `
+      <div id="ramp" style="background:linear-gradient(90deg, #00e5ff, #80ffb0, #ff5050)"></div>
+      <div class="row"><span class="sub">0 horizontal</span><span class="count" style="margin-left:auto">1 vertical</span></div>`;
+  } else if (mode === 'intensity') {
+    legend.innerHTML = `
+      <div id="ramp" style="background:linear-gradient(90deg, #000, #fff)"></div>
+      <div class="row"><span class="sub">0 weak</span><span class="count" style="margin-left:auto">255 strong</span></div>`;
+  } else {
+    legend.innerHTML = `<p class="sub">Colour from scanner photographs; accuracy depends on lighting.</p>`;
+  }
+  controlsBox.style.display = mode === 'class' ? 'block' : 'none';
+}
+
+// visible-class checkboxes
+const controlsBox = document.getElementById('controls');
+let checks = {};
+for (const [id, info] of Object.entries(manifest.classes)) {
+  const label = document.createElement('label');
+  label.innerHTML = `<input type="checkbox" checked data-class="${id}"> ${info.name}`;
+  controlsBox.appendChild(label);
+  checks[id] = label.querySelector('input');
+}
+controlsBox.addEventListener('change', () => {
+  const on = new Set(Object.entries(checks).filter(([, el]) => el.checked).map(([id]) => Number(id)));
+  currentFilter = on.size === Object.keys(checks).length ? null : on;
+  rebuild();
+});
+
+document.getElementById('mode').addEventListener('change', () => { renderLegend(); rebuild(); });
+const psize = document.getElementById('psize');
+psize.addEventListener('input', () => {
+  mat.size = Number(psize.value) / 50;
+  document.getElementById('psizeVal').textContent = psize.value;
+});
+
+document.getElementById('stats').textContent =
+  `${manifest.point_count.toLocaleString()} of ${manifest.full_point_count.toLocaleString()} points shown ` +
+  `(voxel decimation, ${manifest.voxel_size_m} m cells). Scan extent: ` +
+  `${(manifest.bounds_max[0] - manifest.bounds_min[0]).toFixed(1)} x ` +
+  `${(manifest.bounds_max[1] - manifest.bounds_min[1]).toFixed(1)} x ` +
+  `${(manifest.bounds_max[2] - manifest.bounds_min[2]).toFixed(1)} m.`;
+document.getElementById('fields').textContent =
+  'Per-point fields: RGB (photographic colour), classification (0 noise, ' +
+  '1 objects/facades, 2 sidewalk, 5 tree cover, 11 pavement), intensity, ' +
+  'sidewalk_width_discrete (usable clear width, m), verticality (surface tilt).';
+
+const countLine = document.createElement('p');
+countLine.className = 'sub';
+countLine.id = 'countShown';
+document.getElementById('panel').appendChild(countLine);
+
+renderLegend();
+document.getElementById('loading').classList.add('done');
+rebuild();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+<script>
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('loading');
+  el.classList.remove('done');
+  el.innerHTML = `<span id="error">Failed to load: ${e.message}</span>`;
+});
+</script>
+</body>
+</html>

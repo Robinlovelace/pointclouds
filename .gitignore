@@ -1,0 +1,12 @@
+# generated data (downloaded or processed)
+data/
+viz/pc.bin
+viz/manifest.json
+
+# python
+.venv/
+__pycache__/
+
+# netlify / tooling state
+.netlify/
+node_modules/
