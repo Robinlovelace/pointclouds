@@ -31,9 +31,9 @@ RECORD_BYTES = 25
 CLASS_NAMES = {
     0: "Not classified (noise / irrelevant)",
     1: "Objects and facades",
-    2: "Sidewalk",
+    2: "Sidewalk (pedestrian footway)",
     5: "Tree cover",
-    11: "Pavement",
+    11: "Pavement (roadway / carriageway)",
 }
 
 
@@ -41,16 +41,19 @@ def voxel_decimate(points: np.ndarray, max_points: float) -> tuple[np.ndarray, f
     """Adaptive voxel-grid decimation.
 
     Keeps the first point falling inside each voxel of side `size`, growing the
-    voxel size until at most `max_points` points remain. Deterministic.
+    voxel size until at most `max_points` points remain. Deterministic. The
+    voxel key is a mixed-radix integer (ix * ny * nz + iy * nz + iz), which is
+    injective by construction, unlike a composite-linear key.
     """
     xyz = points
     lo = xyz.min(axis=0)
     for size in (0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0):
-        keys = np.floor((xyz - lo) / size).astype(np.int64)
-        keys *= np.array([np.iinfo(np.int64).max // (2**40 + 1),
-                          2**20 + 1,
-                          1])
-        _, first = np.unique(keys.sum(axis=1), return_index=True)
+        idx = np.floor((xyz - lo) / size).astype(np.int64)
+        nx, ny, nz = (int(v) for v in (idx.max(axis=0) + 1))
+        if nx * ny * nz >= 2**63:
+            continue  # would overflow int64 keys; try a larger voxel size
+        keys = (idx[:, 0] * ny + idx[:, 1]) * nz + idx[:, 2]
+        _, first = np.unique(keys, return_index=True)
         if len(first) <= max_points:
             sel = np.sort(first)
             return sel, size
@@ -65,6 +68,9 @@ def main() -> None:
     args = ap.parse_args()
 
     src = pathlib.Path(args.input)
+    if not src.is_file():
+        raise SystemExit(f"Input not found: {src}\n"
+                         "Run scripts/download_data.py first (see README.md).")
     outdir = pathlib.Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -74,10 +80,28 @@ def main() -> None:
     n_full = len(las)
     print(f"  {n_full:,} points, version {header.version}, point format {header.point_format.id}")
 
+    required = ["sidewalk_width_discrete", "Verticality"]
+    missing = [d for d in required if d not in las.point_format.dimension_names]
+    if missing:
+        available = [d.name for d in las.point_format.dimensions]
+        raise SystemExit(f"This LAZ lacks the expected extra dimension(s) {missing}.\n"
+                         f"Dimensions present: {available}")
+
     xyz = np.column_stack([las.x, las.y, las.z]).astype(np.float32)
+    if not np.isfinite(xyz).all():
+        finite = np.isfinite(xyz).all(axis=1)
+        print(f"  dropping {(~finite).sum():,} points with non-finite coordinates")
+        xyz = xyz[finite]
+        las.points = las.points[finite]
     rgb8 = (np.column_stack([las.red, las.green, las.blue]) >> 8).astype(np.uint8)
+    intensity = np.asarray(las.intensity)
+    # LAS intensity may be 8- or 16-bit depending on the source; scale
+    # consistently into 0-255 rather than truncating mod 256.
+    if intensity.max() <= 255:
+        intensity = intensity.astype(np.uint8)
+    else:
+        intensity = (intensity.astype(np.float32) / 65535 * 255).astype(np.uint8)
     cls = np.asarray(las.classification).astype(np.uint8)
-    intensity = np.asarray(las.intensity).astype(np.uint8)
     width = np.asarray(las["sidewalk_width_discrete"]).astype(np.float32)
     vert = np.asarray(las["Verticality"]).astype(np.float32)
 
@@ -91,16 +115,20 @@ def main() -> None:
     n = len(sel)
     print(f"  kept {n:,} points with {voxel_size} m voxels")
 
-    # Interleaved binary: position, rgb, class, intensity, width, verticality.
+    # Interleaved binary (little-endian): position, rgb, class, intensity,
+    # width, verticality. NaN width/verticality means "no data" for that point
+    # (the field is only computed where relevant); the viewer renders those as
+    # grey rather than mapping them onto the colour ramps.
     rec = np.zeros(n, dtype=np.dtype([
-        ("xyz", np.float32, 3),
-        ("rgb", np.uint8, 3),
-        ("cls", np.uint8),
-        ("intensity", np.uint8),
-        ("width", np.float32),
-        ("vert", np.float32),
+        ("xyz", "<f4", 3),
+        ("rgb", "u1", 3),
+        ("cls", "u1"),
+        ("intensity", "u1"),
+        ("width", "<f4"),
+        ("vert", "<f4"),
     ]))
-    assert rec.itemsize == RECORD_BYTES, f"record size {rec.itemsize} != {RECORD_BYTES}"
+    if rec.itemsize != RECORD_BYTES:
+        raise RuntimeError(f"record size {rec.itemsize} != {RECORD_BYTES}")
     rec["xyz"] = xyz
     rec["rgb"] = rgb8
     rec["cls"] = cls
@@ -120,7 +148,7 @@ def main() -> None:
                               "teaching purposes; contact IFP for reuse beyond "
                               "that scope.",
         "scan": {
-            "location": "Jozsef Street, Budapest",
+            "location": "József Street, Budapest",
             "method": "handheld terrestrial laser scanning (street section, "
                       "captured on foot)",
             "date": "2026-05",
@@ -135,9 +163,15 @@ def main() -> None:
                     for k in sorted(set(counts_full) | set(counts_sampled))},
         "fields": {
             "width": "sidewalk_width_discrete: usable clear width in metres, "
-                     "aggregated along the sidewalk axis (lower = tighter)",
-            "verticality": "0 = horizontal surface, 1 = vertical surface",
+                     "aggregated along the sidewalk axis (lower = tighter); "
+                     "NaN = not computed for this point (rendered grey)",
+            "verticality": "0 = horizontal surface, 1 = vertical surface; "
+                           "NaN = not computed (rendered grey)",
             "intensity": "near-infrared return strength, 0-255",
+            "omitted": "the LAZ also carries 'object nr' (per-object segment id) "
+                       "and 'sidewalk_width' (continuous clear width); neither "
+                       "is needed for this viewer and both are dropped to keep "
+                       "the binary compact",
         },
         "bin": {"path": "pc.bin", "record_bytes": RECORD_BYTES,
                 "layout": ["xyz:3:f32", "rgb:3:u8", "cls:1:u8",

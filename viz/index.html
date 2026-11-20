@@ -32,10 +32,14 @@
   #panel select, #panel input[type="range"] { width: 100%; box-sizing: border-box; }
   #panel select { background: #1c1e2a; color: var(--text); border: 1px solid var(--panel-border);
                   border-radius: 6px; padding: 5px; margin-top: 4px; }
+  #resetView { background: #1c1e2a; color: var(--text); border: 1px solid var(--panel-border);
+               border-radius: 6px; padding: 6px 10px; cursor: pointer; margin-top: 8px; }
+  #resetView:hover { background: #262938; }
   #legend .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   #legend .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
   #legend .count { color: var(--muted); margin-left: auto; font-size: 11px; }
   #ramp { height: 12px; border-radius: 6px; margin: 6px 0 2px; }
+  #modeHint { color: var(--muted); font-size: 12px; margin-top: 6px; }
   #loading {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     background: #101018; color: var(--text); font: 14px system-ui, sans-serif; z-index: 5;
@@ -46,6 +50,10 @@
   summary { cursor: pointer; color: var(--text); }
   #credits a { color: var(--accent); }
   #controls input[type="checkbox"] { accent-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 8px; }
+  @media (max-width: 600px) {
+    #panel { width: auto; left: 12px; right: 12px; top: 12px; max-height: 45vh; }
+  }
 </style>
 </head>
 <body>
@@ -55,7 +63,7 @@
   <h1>Sidewalk point cloud</h1>
   <p class="sub">Open teaching example: 3D LiDAR scan of a street
     (József Street, Budapest, May 2026, handheld scanner). Data (c) International
-    Federation of Pedestrians (IFP). See <a href="https://github.com/Robinlovelace/pointclouds">repository</a>.</p>
+    Federation of Pedestrians (IFP).</p>
 
   <h2>Colour by</h2>
   <select id="mode">
@@ -65,8 +73,8 @@
     <option value="vert">Verticality</option>
     <option value="intensity">Intensity (greyscale)</option>
   </select>
-
   <div id="legend"></div>
+  <p id="modeHint"></p>
 
   <h2>Visible classes</h2>
   <div id="controls"></div>
@@ -74,8 +82,9 @@
   <h2>Point size</h2>
   <input type="range" id="psize" min="1" max="10" step="0.5" value="3">
   <span id="psizeVal" class="sub">3</span>
+  <button id="resetView" type="button">Reset view</button>
 
-  <details>
+  <details open>
     <summary>About the data</summary>
     <p id="stats" class="sub"></p>
     <p class="sub" id="fields"></p>
@@ -84,10 +93,11 @@
     <summary>Credits and licence</summary>
     <p class="sub">Point cloud: International Federation of Pedestrians (IFP),
       scan of József Street, Budapest, May 2026
-      (<a href="https://data.ifpedestrians.org/etc/sidewalk_demo.laz">source</a>).
+      (<a href="https://ifpedestrians.org">ifpedestrians.org</a>).
       Viewer code: MIT licence, written to be read alongside the class codes
-      used by IFP's sidewalk analysis workflow.</p>
+      used in IFP's sidewalk analysis workflow.</p>
   </details>
+  <p class="hint">Left-drag: orbit &nbsp;|&nbsp; right-drag: pan &nbsp;|&nbsp; scroll: zoom</p>
 </div>
 
 <script type="importmap">
@@ -98,32 +108,51 @@
   }
 }
 </script>
+<script>
+let loadDone = false;
+function showError(msg) {
+  if (loadDone) { console.warn('Runtime error:', msg); return; }
+  const el = document.getElementById('loading');
+  el.classList.remove('done');
+  el.innerHTML = `<span id="error">Failed to load: ${String(msg)}</span>`;
+}
+window.addEventListener('error', (e) => showError(e.message || 'runtime error'));
+window.addEventListener('unhandledrejection', (e) => showError(e.reason?.message || e.reason || 'unknown error'));
+</script>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-const CLASS_COLORS = {
-  0: 0x6e6e6e,  // grey  - not classified
-  1: 0xd8b26e,  // ochre - objects and facades
-  2: 0x2dd4a7,  // green - sidewalk
-  5: 0x2e7d32,  // dark green - tree cover
-  11: 0x5c8bd6, // blue  - pavement
-};
-
-const manifest = await fetch('./manifest.json').then(r => {
+// Resolve data paths relative to this module, not the server root, so the page
+// works from any deploy subpath.
+const manifestUrl = new URL('./manifest.json', import.meta.url);
+const manifest = await fetch(manifestUrl).then(r => {
   if (!r.ok) throw new Error(`manifest.json: HTTP ${r.status}`);
   return r.json();
 });
+const binUrl = new URL(manifest.bin.path, manifestUrl);
 
-// ---- load interleaved binary -------------------------------------------
 const { point_count: n, bin } = manifest;
-const buf = await fetch(bin.path).then(r => {
-  if (!r.ok) throw new Error(`${bin.path}: HTTP ${r.status}`);
-  return r.arrayBuffer();
-});
+const resp = await fetch(binUrl);
+if (!resp.ok) throw new Error(`${manifest.bin.path}: HTTP ${resp.status}`);
+const totalBytes = Number(resp.headers.get('Content-Length')) || n * bin.record_bytes;
+const reader = resp.body.getReader();
+const chunks = [];
+let got = 0;
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  chunks.push(value);
+  got += value.length;
+  document.getElementById('loading').textContent =
+    `Loading point cloud… ${(got / 1e6).toFixed(1)} MB`;
+}
+const buf = await new Blob(chunks).arrayBuffer();
 if (buf.byteLength !== n * bin.record_bytes) {
   throw new Error(`size mismatch: ${buf.byteLength} bytes for ${n} records`);
 }
+
+// ---- deinterleave --------------------------------------------------------
 const view = new DataView(buf);
 const pos = new Float32Array(n * 3);
 const rgb = new Uint8Array(n * 3);
@@ -145,7 +174,7 @@ for (let i = 0; i < n; i++) {
   vert[i] = view.getFloat32(o + 21, true);
 }
 
-// ---- three.js scene -----------------------------------------------------
+// ---- three.js scene ------------------------------------------------------
 const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -155,131 +184,226 @@ app.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x101018);
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
+camera.up.set(0, 0, 1); // the data is Z-up (geospatial convention)
 
 const lo = new THREE.Vector3(...manifest.bounds_min);
 const hi = new THREE.Vector3(...manifest.bounds_max);
 const centre = lo.clone().add(hi).multiplyScalar(0.5);
 const radius = lo.distanceTo(hi) / 2;
+const HOME = new THREE.Vector3(centre.x - radius * 0.7, centre.y - radius * 1.3, centre.z + radius * 1.1);
 
-camera.position.set(centre.x + radius * 1.4, centre.y + radius * 2.2, centre.z + radius * 1.8);
+camera.position.copy(HOME);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.copy(centre);
 controls.update();
 
-// ---- geometry -----------------------------------------------------------
+// ---- geometry: fixed buffers, updated in place (no per-switch GPU leak) ---
+// The colour attribute holds linear-sRGB bytes: three r160 consumes normalized
+// Uint8 colour attributes as working-space (linear) values.
 const geometry = new THREE.BufferGeometry();
-let currentFilter = null; // Set of visible class ids, or null for all
-const colorArr = new Uint8Array(n * 3);
-const indexSel = new Uint32Array(n);
-const posSel = new Float32Array(n * 3);
+const posAttr = new THREE.BufferAttribute(pos, 3, false);
 const colorSel = new Uint8Array(n * 3);
+const colAttr = new THREE.BufferAttribute(colorSel, 3, true);
+const indexSel = new Uint32Array(n);
+const idxAttr = new THREE.BufferAttribute(indexSel, 1);
+geometry.setAttribute('position', posAttr);
+geometry.setAttribute('color', colAttr);
+geometry.setIndex(idxAttr);
+geometry.computeBoundingSphere();
 
 const mat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, sizeAttenuation: true });
 const points = new THREE.Points(geometry, mat);
 scene.add(points);
 
-function rampWidth(w) {
-  // Blue at <= 1.5 m, white at 2.0 m, red at >= 2.5 m (clamped beyond).
-  const t = THREE.MathUtils.clamp((w - 1.5) / 1.0, 0, 1);
-  const c = new THREE.Color();
-  if (t < 0.5) c.setRGB(0.1 + 0.9 * (t * 2), 0.2 + 0.8 * (t * 2), 0.9);
-  else c.setRGB(1.0, 0.2 + 0.8 * ((1 - t) * 2), 0.1 + 0.9 * ((1 - t) * 2));
-  return c;
-}
-function rampVert(v) {
-  // horizontal (0) cyan -> vertical (1) red
-  return new THREE.Color().setHSL(0.5 * (1 - v), 0.9, 0.5);
+// ---- colour LUTs (precomputed once; output is linear-sRGB bytes) ----------
+const GREY_BYTES = [110, 110, 110];
+{
+  const c = new THREE.Color(0x6e6e6e);
+  GREY_BYTES[0] = c.r * 255; GREY_BYTES[1] = c.g * 255; GREY_BYTES[2] = c.b * 255;
 }
 
+const CLASS_COLORS = {
+  0: 0x6e6e6e,  // grey  - not classified
+  1: 0xd8b26e,  // ochre - objects and facades
+  2: 0x2dd4a7,  // green - sidewalk
+  5: 0x2e7d32,  // dark green - tree cover
+  11: 0x5c8bd6, // blue  - pavement
+};
+const classColorHex = (id) => CLASS_COLORS[id] ?? 0xffffff;
+const CLASS_BYTES = new Uint8Array(256 * 3);
+for (let c = 0; c < 256; c++) { // default white, matching the legend fallback
+  const o = c * 3;
+  CLASS_BYTES[o] = 255; CLASS_BYTES[o + 1] = 255; CLASS_BYTES[o + 2] = 255;
+}
+for (const [id, hexv] of Object.entries(CLASS_COLORS)) {
+  const c = new THREE.Color(hexv); // sRGB hex -> linear working space
+  const o = Number(id) * 3;
+  CLASS_BYTES[o] = c.r * 255; CLASS_BYTES[o + 1] = c.g * 255; CLASS_BYTES[o + 2] = c.b * 255;
+}
+
+// sRGB -> linear LUT for the photographic RGB bytes
+const SRGB_LUT = new Float32Array(256);
+for (let v = 0; v < 256; v++) {
+  const s = v / 255;
+  SRGB_LUT[v] = s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+}
+
+const LUT_BINS = 1023;
+function buildRampLUT(stops) {
+  // stops: [[t, [r,g,b] in sRGB 0-1], ...] sorted by t; linear bytes out
+  const lut = new Uint8Array((LUT_BINS + 1) * 3);
+  const c = new THREE.Color();
+  for (let i = 0; i <= LUT_BINS; i++) {
+    const t = i / LUT_BINS;
+    let a = stops[0], b = stops[stops.length - 1];
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (t >= stops[s][0] && t <= stops[s + 1][0]) { a = stops[s]; b = stops[s + 1]; break; }
+    }
+    const f = b[0] === a[0] ? 0 : (t - a[0]) / (b[0] - a[0]);
+    c.setRGB(a[1][0] + (b[1][0] - a[1][0]) * f,
+             a[1][1] + (b[1][1] - a[1][1]) * f,
+             a[1][2] + (b[1][2] - a[1][2]) * f, THREE.SRGBColorSpace);
+    lut[i * 3] = c.r * 255; lut[i * 3 + 1] = c.g * 255; lut[i * 3 + 2] = c.b * 255;
+  }
+  return lut;
+}
+// clear width: red = tight (<=1.5 m), white = 2.0 m, blue = wide (>=2.5 m)
+const WIDTH_LUT = buildRampLUT([[0, [1, 0.31, 0.31]], [0.5, [1, 1, 1]], [1, [0.1, 0.25, 0.56]]]);
+// verticality: cyan (horizontal) -> pale green -> red (vertical)
+const VERT_LUT = buildRampLUT([[0, [0, 0.9, 1]], [0.5, [0.5, 1, 0.69]], [1, [1, 0.31, 0.31]]]);
+const INTENSITY_LUT = new Uint8Array(256 * 3);
+{
+  const c = new THREE.Color();
+  for (let v = 0; v < 256; v++) {
+    c.setRGB(v / 255, v / 255, v / 255, THREE.SRGBColorSpace);
+    INTENSITY_LUT[v * 3] = c.r * 255;
+    INTENSITY_LUT[v * 3 + 1] = c.g * 255;
+    INTENSITY_LUT[v * 3 + 2] = c.b * 255;
+  }
+}
+
+// ---- rebuild: fill index + colour buffers in place, zero allocations ------
+let currentFilter = null; // Set of visible class ids, or null for all
 function rebuild() {
   const mode = document.getElementById('mode').value;
   let m = 0;
   for (let i = 0; i < n; i++) {
     if (currentFilter && !currentFilter.has(cls[i])) continue;
     indexSel[m] = i;
+    const o = m * 3;
+    if (mode === 'rgb') {
+      const p = i * 3;
+      colorSel[o] = SRGB_LUT[rgb[p]] * 255;
+      colorSel[o + 1] = SRGB_LUT[rgb[p + 1]] * 255;
+      colorSel[o + 2] = SRGB_LUT[rgb[p + 2]] * 255;
+    } else if (mode === 'class') {
+      const s = cls[i] * 3;
+      colorSel[o] = CLASS_BYTES[s];
+      colorSel[o + 1] = CLASS_BYTES[s + 1];
+      colorSel[o + 2] = CLASS_BYTES[s + 2];
+    } else if (mode === 'width') {
+      if (Number.isFinite(width[i])) {
+        const s = Math.round(THREE.MathUtils.clamp((width[i] - 1.5) / 1.0, 0, 1) * LUT_BINS) * 3;
+        colorSel[o] = WIDTH_LUT[s]; colorSel[o + 1] = WIDTH_LUT[s + 1]; colorSel[o + 2] = WIDTH_LUT[s + 2];
+      } else { colorSel[o] = GREY_BYTES[0]; colorSel[o + 1] = GREY_BYTES[1]; colorSel[o + 2] = GREY_BYTES[2]; }
+    } else if (mode === 'vert') {
+      if (Number.isFinite(vert[i])) {
+        const s = Math.round(THREE.MathUtils.clamp(vert[i], 0, 1) * LUT_BINS) * 3;
+        colorSel[o] = VERT_LUT[s]; colorSel[o + 1] = VERT_LUT[s + 1]; colorSel[o + 2] = VERT_LUT[s + 2];
+      } else { colorSel[o] = GREY_BYTES[0]; colorSel[o + 1] = GREY_BYTES[1]; colorSel[o + 2] = GREY_BYTES[2]; }
+    } else { // intensity
+      const s = intensity[i] * 3;
+      colorSel[o] = INTENSITY_LUT[s]; colorSel[o + 1] = INTENSITY_LUT[s + 1]; colorSel[o + 2] = INTENSITY_LUT[s + 2];
+    }
     m++;
   }
-  const sel = indexSel.subarray(0, m);
-  const posOut = posSel.subarray(0, m * 3);
-  const colOut = colorSel.subarray(0, m * 3);
-  for (let j = 0; j < m; j++) {
-    const i = sel[j];
-    posOut[j * 3] = pos[i * 3];
-    posOut[j * 3 + 1] = pos[i * 3 + 1];
-    posOut[j * 3 + 2] = pos[i * 3 + 2];
-    let c;
-    if (mode === 'rgb') {
-      colOut[j * 3] = rgb[i * 3];
-      colOut[j * 3 + 1] = rgb[i * 3 + 1];
-      colOut[j * 3 + 2] = rgb[i * 3 + 2];
-      continue;
-    } else if (mode === 'class') {
-      c = new THREE.Color(CLASS_COLORS[cls[i]] ?? 0xffffff);
-    } else if (mode === 'width') {
-      c = rampWidth(width[i]);
-    } else if (mode === 'vert') {
-      c = rampVert(vert[i]);
-    } else {
-      const g = intensity[i];
-      c = new THREE.Color(g / 255, g / 255, g / 255);
-    }
-    colOut[j * 3] = c.r * 255;
-    colOut[j * 3 + 1] = c.g * 255;
-    colOut[j * 3 + 2] = c.b * 255;
-  }
-  geometry.setAttribute('position', new THREE.BufferAttribute(posOut, 3, false));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colOut, 3, true));
-  geometry.computeBoundingSphere();
+  idxAttr.needsUpdate = true;
+  colAttr.needsUpdate = true;
+  geometry.setDrawRange(0, m);
   points.visible = m > 0;
   document.getElementById('countShown').textContent = `${m.toLocaleString()} points shown`;
 }
 
 // ---- UI ------------------------------------------------------------------
-function rampCSS(t) { return `rgb(${t[0]},${t[1]},${t[2]})`; }
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function swatch(cssColor) {
+  const s = el('span', 'swatch');
+  s.style.background = cssColor;
+  return s;
+}
+function ramp(cssGradient) {
+  const r = el('div');
+  r.id = 'ramp';
+  r.style.background = cssGradient;
+  return r;
+}
+
+const MODE_HINTS = {
+  rgb: 'Colour from scanner photographs; accuracy depends on lighting.',
+  class: 'Class codes from IFP sidewalk analysis; filter classes below.',
+  width: 'Usable clear width in metres (aggregated along the sidewalk axis); grey = not computed for that point.',
+  vert: '0 = horizontal surface, 1 = vertical; good for spotting kerbs, walls and obstacles; grey = not computed.',
+  intensity: 'Near-infrared laser return strength; a reliable greyscale view of the scene.',
+};
 
 function renderLegend() {
   const mode = document.getElementById('mode').value;
   const legend = document.getElementById('legend');
-  const controlsBox = document.getElementById('controls');
-  legend.innerHTML = '';
+  legend.textContent = '';
+  document.getElementById('modeHint').textContent = MODE_HINTS[mode] || '';
   if (mode === 'class') {
     for (const [id, info] of Object.entries(manifest.classes)) {
-      const c = CLASS_COLORS[id];
-      const row = document.createElement('div');
-      row.className = 'row';
-      row.innerHTML = `<span class="swatch" style="background:#${new THREE.Color(c).getHexString()}"></span>
-        <span>${info.name}</span><span class="count">${info.count_sampled.toLocaleString()}</span>`;
+      const c = new THREE.Color(classColorHex(id));
+      const row = el('div', 'row');
+      row.appendChild(swatch(`#${c.getHexString()}`));
+      row.appendChild(el('span', null, info.name));
+      row.appendChild(el('span', 'count', info.count_sampled.toLocaleString()));
       legend.appendChild(row);
     }
   } else if (mode === 'width') {
-    legend.innerHTML = `
-      <div id="ramp" style="background:linear-gradient(90deg, #1a3f8f, #ffffff, #ff1a1a)"></div>
-      <div class="row"><span class="sub">1.5 m (tight)</span><span class="count" style="margin-left:auto">2.5 m (wide)</span></div>`;
+    legend.appendChild(ramp('linear-gradient(90deg, #ff5050, #ffffff, #1a3f8f)'));
+    const row = el('div', 'row');
+    row.appendChild(el('span', 'sub', '1.5 m (tight)'));
+    row.appendChild(el('span', 'sub', 'grey = no data'));
+    row.appendChild(el('span', 'sub', '2.5 m (wide)'));
+    legend.appendChild(row);
   } else if (mode === 'vert') {
-    legend.innerHTML = `
-      <div id="ramp" style="background:linear-gradient(90deg, #00e5ff, #80ffb0, #ff5050)"></div>
-      <div class="row"><span class="sub">0 horizontal</span><span class="count" style="margin-left:auto">1 vertical</span></div>`;
+    legend.appendChild(ramp('linear-gradient(90deg, #00e5ff, #80ffb0, #ff5050)'));
+    const row = el('div', 'row');
+    row.appendChild(el('span', 'sub', '0 horizontal'));
+    row.appendChild(el('span', 'sub', 'grey = no data'));
+    row.appendChild(el('span', 'sub', '1 vertical'));
+    legend.appendChild(row);
   } else if (mode === 'intensity') {
-    legend.innerHTML = `
-      <div id="ramp" style="background:linear-gradient(90deg, #000, #fff)"></div>
-      <div class="row"><span class="sub">0 weak</span><span class="count" style="margin-left:auto">255 strong</span></div>`;
-  } else {
-    legend.innerHTML = `<p class="sub">Colour from scanner photographs; accuracy depends on lighting.</p>`;
+    legend.appendChild(ramp('linear-gradient(90deg, #000, #fff)'));
+    const row = el('div', 'row');
+    row.appendChild(el('span', 'sub', '0 weak'));
+    row.appendChild(el('span', 'sub', '255 strong'));
+    legend.appendChild(row);
   }
-  controlsBox.style.display = mode === 'class' ? 'block' : 'none';
 }
 
-// visible-class checkboxes
+// visible-class checkboxes (built with textContent, never innerHTML)
 const controlsBox = document.getElementById('controls');
-let checks = {};
+const checks = {};
 for (const [id, info] of Object.entries(manifest.classes)) {
-  const label = document.createElement('label');
-  label.innerHTML = `<input type="checkbox" checked data-class="${id}"> ${info.name}`;
+  const label = el('label');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = true;
+  box.dataset.class = id;
+  label.appendChild(box);
+  label.appendChild(document.createTextNode(` ${info.name}`));
   controlsBox.appendChild(label);
-  checks[id] = label.querySelector('input');
+  checks[id] = box;
 }
 controlsBox.addEventListener('change', () => {
-  const on = new Set(Object.entries(checks).filter(([, el]) => el.checked).map(([id]) => Number(id)));
+  const on = new Set(Object.entries(checks).filter(([, cb]) => cb.checked).map(([id]) => Number(id)));
   currentFilter = on.size === Object.keys(checks).length ? null : on;
   rebuild();
 });
@@ -290,6 +414,11 @@ psize.addEventListener('input', () => {
   mat.size = Number(psize.value) / 50;
   document.getElementById('psizeVal').textContent = psize.value;
 });
+document.getElementById('resetView').addEventListener('click', () => {
+  camera.position.copy(HOME);
+  controls.target.copy(centre);
+  controls.update();
+});
 
 document.getElementById('stats').textContent =
   `${manifest.point_count.toLocaleString()} of ${manifest.full_point_count.toLocaleString()} points shown ` +
@@ -298,18 +427,16 @@ document.getElementById('stats').textContent =
   `${(manifest.bounds_max[1] - manifest.bounds_min[1]).toFixed(1)} x ` +
   `${(manifest.bounds_max[2] - manifest.bounds_min[2]).toFixed(1)} m.`;
 document.getElementById('fields').textContent =
-  'Per-point fields: RGB (photographic colour), classification (0 noise, ' +
-  '1 objects/facades, 2 sidewalk, 5 tree cover, 11 pavement), intensity, ' +
-  'sidewalk_width_discrete (usable clear width, m), verticality (surface tilt).';
+  Object.values(manifest.fields).join(' ');
 
-const countLine = document.createElement('p');
-countLine.className = 'sub';
+const countLine = el('p', 'sub', '');
 countLine.id = 'countShown';
 document.getElementById('panel').appendChild(countLine);
 
 renderLegend();
-document.getElementById('loading').classList.add('done');
 rebuild();
+loadDone = true;
+document.getElementById('loading').classList.add('done');
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -320,13 +447,6 @@ addEventListener('resize', () => {
 renderer.setAnimationLoop(() => {
   controls.update();
   renderer.render(scene, camera);
-});
-</script>
-<script>
-window.addEventListener('error', (e) => {
-  const el = document.getElementById('loading');
-  el.classList.remove('done');
-  el.innerHTML = `<span id="error">Failed to load: ${e.message}</span>`;
 });
 </script>
 </body>
